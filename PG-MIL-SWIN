@@ -1,0 +1,2265 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# SECTION B — FINAL SCI-READY NOVEL MODEL CODE — NaN-SAFE + KAGGLE-OFFLINE-SAFE
+# PG-MIL-Swin: Prototype-Guided 2.5D Attention Multi-Instance Transformer
+# for Interpretable CHCC / HCC / ICC Classification in Uncropped Abdominal CT
+#
+# This section assumes Section A has already created:
+#   DATA_ROOT/
+#      train/train_metadata.csv
+#      val/val_metadata.csv
+#      test/test_metadata.csv
+#      metadata_for_sectionB/train_2p5d_metadata.csv
+#      metadata_for_sectionB/val_2p5d_metadata.csv
+#      metadata_for_sectionB/test_2p5d_metadata.csv
+#
+# Main novelty:
+#   1) Classification-only, no tumour segmentation, no YOLO cropping.
+#   2) 2.5D input: previous + current + next CT slice.
+#   3) Swin/Transformer feature extractor.
+#   4) Case-level Attention MIL.
+#   5) Prototype-guided class reasoning at case level.
+#   6) Difficulty-aware curriculum focal loss.
+#   7) 1000-DPI journal plots + full results ZIP + paper package ZIP.
+#
+# Important wording for paper:
+#   The model learns discriminative CT prototypes from high-attention case-level
+#   representations. Do NOT claim exact tumour localization because no tumour
+#   segmentation mask is used.
+# =============================================================================
+
+import os
+import json
+import random
+import shutil
+import zipfile
+import warnings
+import hashlib
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
+
+# Determinism settings must be set before torch import.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("PYTHONHASHSEED", "0")
+# Kaggle/offline safety: prevents Hugging Face Hub download attempts.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+import numpy as np
+import pandas as pd
+import cv2
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast as cuda_autocast
+from torch.cuda.amp import GradScaler
+
+import timm
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    precision_recall_fscore_support,
+    confusion_matrix,
+    classification_report,
+    roc_auc_score,
+    roc_curve,
+    average_precision_score,
+    precision_recall_curve,
+    log_loss,
+    matthews_corrcoef,
+    cohen_kappa_score,
+)
+
+warnings.filterwarnings("ignore")
+
+
+# =============================================================================
+# B0) CONFIGURATION
+# =============================================================================
+
+CFG = {
+    # Change only if your Section A output folder is different.
+    "DATA_ROOT": "/kaggle/working/Liver_C1_Malignant_LeakageSafe_MIL_2p5D_NoOfflineAug",
+
+    # Section B results folder.
+    "RUN_ROOT": "/kaggle/working/SECTION_B_PG_MIL_SWIN_SCI_1000DPI",
+
+    "CLASSES": ["CHCC", "HCC", "ICC"],
+
+    # 3 seeds are acceptable. Use 5 seeds for final submission if GPU allows.
+    "SEEDS": [42, 43, 44],
+
+    # Determinism.
+    "DETERMINISTIC": True,
+    "DETERMINISTIC_WARN_ONLY": True,
+
+    # Image and dataloader.
+    "IMG_SIZE": 224,
+    "NUM_WORKERS": 0,
+    "PIN_MEMORY": True,
+
+    # 2.5D mode.
+    "USE_2P5D_METADATA": True,
+    "USE_GRAYSCALE_2P5D": True,
+
+    # Normalization.
+    "NORM_MODE": "imagenet",
+    "IMAGENET_MEAN": [0.485, 0.456, 0.406],
+    "IMAGENET_STD": [0.229, 0.224, 0.225],
+
+    # Transformer backbone. Resolver will fallback if exact model is unavailable.
+    "BACKBONE": "swin_tiny_patch4_window7_224",
+
+    # Kaggle/offline safety.
+    # False = do not download pretrained weights from Hugging Face / internet.
+    # Set True only when Kaggle Internet is ON or weights are already cached.
+    "USE_PRETRAINED_BACKBONE": True,
+
+    # Slice-level 2.5D pretraining.
+    "SLICE_BATCH": 16,
+    "SLICE_EPOCHS": 35,
+    "SLICE_LR": 1e-4,
+    "WEIGHT_DECAY": 0.05,
+    "AMP_SLICE": False,
+    "EARLY_STOP_PATIENCE": 8,
+
+    # Difficulty-aware curriculum focal loss.
+    "USE_CURRICULUM_FOCAL": True,
+    "FOCAL_GAMMA_MAX": 2.0,
+    "FOCAL_WARMUP_EPOCHS": 12,
+    "USE_CLASS_WEIGHTS": True,
+
+    # Case aggregation baseline.
+    "MAX_SLICES_EVAL": 128,
+
+    # Proposed case-level PG-MIL.
+    "RUN_PG_MIL": True,
+    "MAX_SLICES_TRAIN": 48,
+    "CASE_BATCH": 4,
+    "CASE_EPOCHS": 35,
+    "CASE_LR": 1e-5,
+    "GRAD_CLIP_NORM": 1.0,
+    "PROB_EPS": 1e-7,
+    "AMP_CASE": False,
+    "FUSE_D": 256,
+    "FUSE_HEADS": 4,
+    "DROP": 0.2,
+    "MIL_EARLY_STOP_PATIENCE": 8,
+
+    # Prototype settings.
+    "PROTOTYPES_PER_CLASS": 4,
+    "PROTO_LOGIT_SCALE": 0.5,
+    "PROTO_CLUSTER_LAMBDA": 0.03,
+    "PROTO_SEPARATION_LAMBDA": 0.02,
+
+    # Evaluation.
+    "ECE_BINS": 10,
+    "BOOTSTRAP_N": 1000,
+    "BOOTSTRAP_SEED": 2026,
+
+    # Journal plots.
+    "DPI_SAVE": 1000,
+    "CMAP": "Blues",
+
+    # Packaging.
+    "ZIP_INCLUDE_CHECKPOINTS": True,
+    "MAKE_PAPER_PACKAGE": True,
+
+    # Resume support after Kaggle kernel restart.
+    # Completed seeds are skipped via DONE.json. Incomplete slice/PG-MIL training
+    # resumes from *_last.pt instead of restarting from epoch 1.
+    "RESUME_TRAINING": True,
+    "SAVE_LAST_EVERY_EPOCH": True,
+}
+
+CLASS_TO_IDX = {c: i for i, c in enumerate(CFG["CLASSES"])}
+IDX_TO_CLASS = {i: c for c, i in CLASS_TO_IDX.items()}
+
+# =============================================================================
+# B1) UTILITIES
+# =============================================================================
+
+def seed_everything(seed: int, deterministic: bool = True, warn_only: bool = True):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=warn_only)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+
+
+def ensure_dir(path: str):
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def jdump(obj, path: str):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def jload(path: str):
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def safe_jload(path: str, default=None):
+    if not os.path.exists(path):
+        return default
+    try:
+        return jload(path)
+    except Exception as e:
+        print(f"⚠️ Could not read JSON {path}: {e}")
+        return default
+
+
+def safe_torch_load(path: str, map_location="cpu"):
+    """Torch loader compatible with different PyTorch versions."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+# -----------------------------------------------------------------------------
+# Feature-cache safety helpers
+# -----------------------------------------------------------------------------
+# These prevent old cached features from being reused after slice_best.pt changes.
+# Important for SCI reproducibility and safe resume behaviour.
+# -----------------------------------------------------------------------------
+
+def file_sha1(path: str, block_size: int = 1024 * 1024) -> str:
+    """Compute SHA1 hash of a file for checkpoint-cache consistency."""
+    h = hashlib.sha1()
+
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(block_size)
+            if not block:
+                break
+            h.update(block)
+
+    return h.hexdigest()
+
+
+def feature_cache_signature(ckpt_best: str, backbone_used: str) -> Dict:
+    """
+    Create a signature describing the exact slice checkpoint/config
+    used for feature extraction.
+
+    Cached train/val/test features are reused only if this signature matches.
+    """
+    return {
+        "slice_checkpoint_path": str(ckpt_best),
+        "slice_checkpoint_sha1": file_sha1(ckpt_best) if os.path.exists(ckpt_best) else None,
+        "backbone_used": str(backbone_used),
+        "img_size": int(CFG["IMG_SIZE"]),
+        "use_2p5d_metadata": bool(CFG["USE_2P5D_METADATA"]),
+        "use_grayscale_2p5d": bool(CFG["USE_GRAYSCALE_2P5D"]),
+        "norm_mode": str(CFG["NORM_MODE"]),
+        "classes": list(CFG["CLASSES"]),
+    }
+
+
+def feature_cache_valid(cache_info_path: str, current_sig: Dict, feature_paths: List[str]) -> bool:
+    """
+    Return True only when all cached feature files exist and match the
+    current slice checkpoint/config signature.
+    """
+    if not all(os.path.exists(p) for p in feature_paths):
+        return False
+
+    old_sig = safe_jload(cache_info_path, default=None)
+
+    if not isinstance(old_sig, dict):
+        return False
+
+    return old_sig == current_sig
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    """After loading an optimizer checkpoint, move its state tensors to the active device."""
+    if optimizer is None:
+        return
+
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
+def savefig(path: str):
+    ensure_dir(os.path.dirname(path))
+    plt.savefig(path, dpi=CFG["DPI_SAVE"], bbox_inches="tight")
+
+
+def stable_sort_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    cols = [
+        c for c in
+        ["Split", "Class", "CASE_ID", "Patient_ID", "Slice_Index", "Image_Path"]
+        if c in df.columns
+    ]
+
+    return df.sort_values(cols).reset_index(drop=True)
+
+
+def sanitize_probs_np(
+    p: np.ndarray,
+    num_classes: Optional[int] = None,
+    context: str = "probs"
+) -> np.ndarray:
+    """Return finite, row-normalized probabilities safe for sklearn metrics."""
+    p = np.asarray(p, dtype=np.float64)
+
+    if p.ndim == 1:
+        p = p.reshape(1, -1)
+
+    if num_classes is None:
+        num_classes = p.shape[1]
+
+    eps = float(CFG.get("PROB_EPS", 1e-7))
+
+    bad_before = int(np.size(p) - np.isfinite(p).sum())
+    if bad_before > 0:
+        print(f"⚠️ {context}: replaced {bad_before} non-finite probability values.")
+
+    p = np.nan_to_num(
+        p,
+        nan=1.0 / num_classes,
+        posinf=1.0 / num_classes,
+        neginf=0.0
+    )
+
+    p = np.clip(p, eps, 1.0)
+
+    row_sum = p.sum(axis=1, keepdims=True)
+    bad_rows = (~np.isfinite(row_sum[:, 0])) | (row_sum[:, 0] <= 0)
+
+    if np.any(bad_rows):
+        print(f"⚠️ {context}: reset {int(bad_rows.sum())} bad probability rows to uniform.")
+        p[bad_rows, :] = 1.0 / num_classes
+        row_sum = p.sum(axis=1, keepdims=True)
+
+    p = p / np.clip(row_sum, eps, None)
+    p = np.nan_to_num(
+        p,
+        nan=1.0 / num_classes,
+        posinf=1.0 / num_classes,
+        neginf=0.0
+    )
+
+    p = p / np.clip(p.sum(axis=1, keepdims=True), eps, None)
+
+    return p.astype(np.float64)
+
+
+def softmax_np(logits: np.ndarray) -> np.ndarray:
+    """Stable softmax that cannot pass NaN/Inf into sklearn."""
+    logits = np.asarray(logits, dtype=np.float64)
+
+    if logits.ndim == 1:
+        logits = logits.reshape(1, -1)
+
+    bad = int(np.size(logits) - np.isfinite(logits).sum())
+    if bad > 0:
+        print(f"⚠️ softmax_np: replaced {bad} non-finite logits before softmax.")
+
+    logits = np.nan_to_num(
+        logits,
+        nan=0.0,
+        posinf=50.0,
+        neginf=-50.0
+    )
+
+    logits = np.clip(logits, -50.0, 50.0)
+    logits = logits - logits.max(axis=1, keepdims=True)
+
+    ex = np.exp(logits)
+    p = ex / np.clip(ex.sum(axis=1, keepdims=True), 1e-12, None)
+
+    return sanitize_probs_np(
+        p,
+        num_classes=logits.shape[1],
+        context="softmax_np"
+    )
+
+
+def onehot(y: np.ndarray, k: int) -> np.ndarray:
+    out = np.zeros((len(y), k), dtype=np.float32)
+    out[np.arange(len(y)), y] = 1.0
+    return out
+
+
+def finite_float(x):
+    if x is None:
+        return None
+
+    try:
+        if np.isnan(x) or np.isinf(x):
+            return None
+    except Exception:
+        pass
+
+    return float(x)
+
+# =============================================================================
+# B2) METRICS
+# =============================================================================
+
+def compute_ece(conf: np.ndarray, correct: np.ndarray, bins: int = 10) -> Tuple[float, float]:
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    mce = 0.0
+    n = max(1, len(conf))
+
+    for i in range(bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (conf >= lo) & (conf < hi) if i < bins - 1 else (conf >= lo) & (conf <= hi)
+        if not np.any(mask):
+            continue
+        acc = correct[mask].mean()
+        c = conf[mask].mean()
+        gap = abs(acc - c)
+        ece += (mask.sum() / n) * gap
+        mce = max(mce, gap)
+
+    return float(ece), float(mce)
+
+
+def brier_multiclass(y_oh: np.ndarray, p: np.ndarray) -> float:
+    return float(np.mean(np.sum((p - y_oh) ** 2, axis=1)))
+
+
+def safe_auc_ovr(y_oh: np.ndarray, p: np.ndarray) -> Tuple[float, List[float]]:
+    per = []
+    for i in range(y_oh.shape[1]):
+        if len(np.unique(y_oh[:, i])) < 2:
+            per.append(np.nan)
+        else:
+            per.append(float(roc_auc_score(y_oh[:, i], p[:, i])))
+    macro = float(np.nanmean(per)) if np.any(~np.isnan(per)) else np.nan
+    return macro, per
+
+
+def safe_ap_ovr(y_oh: np.ndarray, p: np.ndarray) -> Tuple[float, List[float]]:
+    per = []
+    for i in range(y_oh.shape[1]):
+        if len(np.unique(y_oh[:, i])) < 2:
+            per.append(np.nan)
+        else:
+            per.append(float(average_precision_score(y_oh[:, i], p[:, i])))
+    macro = float(np.nanmean(per)) if np.any(~np.isnan(per)) else np.nan
+    return macro, per
+
+
+def sens_spec_npv_from_cm(cm: np.ndarray) -> Tuple[List[float], List[float], List[float]]:
+    k = cm.shape[0]
+    total = cm.sum()
+    sens, spec, npv = [], [], []
+
+    for i in range(k):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = total - tp - fn - fp
+        sens.append(float(tp / (tp + fn)) if (tp + fn) > 0 else np.nan)
+        spec.append(float(tn / (tn + fp)) if (tn + fp) > 0 else np.nan)
+        npv.append(float(tn / (tn + fn)) if (tn + fn) > 0 else np.nan)
+
+    return sens, spec, npv
+
+
+def metrics_from_probs(y: np.ndarray, p: np.ndarray, classes: List[str]) -> Dict:
+    y = np.asarray(y, dtype=int).reshape(-1)
+    k = len(classes)
+    p = sanitize_probs_np(p, num_classes=k, context="metrics_from_probs")
+
+    if len(y) == 0:
+        raise ValueError("metrics_from_probs received empty y.")
+    if p.shape[0] != len(y):
+        raise ValueError(f"metrics_from_probs shape mismatch: len(y)={len(y)}, p.shape={p.shape}")
+    if np.any((y < 0) | (y >= k)):
+        raise ValueError(f"metrics_from_probs received labels outside [0,{k-1}].")
+
+    pred = p.argmax(axis=1)
+    y_oh = onehot(y, k)
+
+    cm = confusion_matrix(y, pred, labels=list(range(k)))
+    sens, spec, npv = sens_spec_npv_from_cm(cm)
+    pr, rc, f1c, sup = precision_recall_fscore_support(y, pred, labels=list(range(k)), zero_division=0)
+    auc_macro, auc_per = safe_auc_ovr(y_oh, p)
+    ap_macro, ap_per = safe_ap_ovr(y_oh, p)
+
+    conf = p.max(axis=1)
+    correct = (pred == y).astype(np.float32)
+    ece, mce = compute_ece(conf, correct, bins=CFG["ECE_BINS"])
+
+    try:
+        ll = log_loss(y, p, labels=list(range(k)))
+    except Exception:
+        ll = np.nan
+
+    out = {
+        "n": int(len(y)),
+        "accuracy": float(accuracy_score(y, pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, pred)),
+        "macro_precision": float(precision_score(y, pred, average="macro", zero_division=0)),
+        "macro_recall": float(recall_score(y, pred, average="macro", zero_division=0)),
+        "macro_f1": float(f1_score(y, pred, average="macro", zero_division=0)),
+        "weighted_precision": float(precision_score(y, pred, average="weighted", zero_division=0)),
+        "weighted_recall": float(recall_score(y, pred, average="weighted", zero_division=0)),
+        "weighted_f1": float(f1_score(y, pred, average="weighted", zero_division=0)),
+        "micro_f1": float(f1_score(y, pred, average="micro", zero_division=0)),
+        "mcc": float(matthews_corrcoef(y, pred)),
+        "cohen_kappa": float(cohen_kappa_score(y, pred)),
+        "log_loss": finite_float(ll),
+        "brier_score": brier_multiclass(y_oh, p),
+        "ece": float(ece),
+        "mce": float(mce),
+        "auc_ovr_macro": finite_float(auc_macro),
+        "ap_ovr_macro": finite_float(ap_macro),
+        "confusion_matrix": cm.tolist(),
+        "per_class": {},
+    }
+
+    for i, c in enumerate(classes):
+        out["per_class"][c] = {
+            "support": int(sup[i]),
+            "precision_ppv": float(pr[i]),
+            "recall_sensitivity": float(rc[i]),
+            "f1": float(f1c[i]),
+            "specificity": finite_float(spec[i]),
+            "npv": finite_float(npv[i]),
+            "auc_ovr": finite_float(auc_per[i]),
+            "ap_ovr": finite_float(ap_per[i]),
+        }
+
+    return out
+
+
+
+def export_per_class_table(metrics: Dict, classes: List[str], out_csv: str) -> pd.DataFrame:
+    rows = []
+    for c in classes:
+        d = metrics["per_class"][c]
+        rows.append({
+            "Class": c,
+            "Support": d["support"],
+            "Sensitivity_Recall": d["recall_sensitivity"],
+            "Specificity": d["specificity"],
+            "Precision_PPV": d["precision_ppv"],
+            "NPV": d["npv"],
+            "F1": d["f1"],
+            "AUROC_OvR": d["auc_ovr"],
+            "AUPRC_AP_OvR": d["ap_ovr"],
+        })
+    df = pd.DataFrame(rows)
+    ensure_dir(os.path.dirname(out_csv))
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+def export_prediction_table(y, p, ids, paths, classes, out_csv):
+    pred = p.argmax(axis=1)
+    rows = []
+    for i in range(len(y)):
+        row = {
+            "ID": ids[i],
+            "True_Label": classes[int(y[i])],
+            "Pred_Label": classes[int(pred[i])],
+            "Correct": int(pred[i] == y[i]),
+            "Confidence": float(p[i, pred[i]]),
+        }
+        if paths is not None:
+            row["Image_Path"] = paths[i]
+        for j, c in enumerate(classes):
+            row[f"Prob_{c}"] = float(p[i, j])
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    ensure_dir(os.path.dirname(out_csv))
+    df.to_csv(out_csv, index=False)
+    return df
+
+
+# =============================================================================
+# B3) 1000-DPI PLOTS
+# =============================================================================
+
+def plot_confusion(cm, classes, title, out_png, normalize=False):
+    if normalize:
+        mat = cm / np.clip(cm.sum(axis=1, keepdims=True), 1, None)
+        fmt = "{:.2f}"
+        label = "Proportion"
+    else:
+        mat = cm
+        fmt = "{:d}"
+        label = "Count"
+
+    plt.figure(figsize=(6, 5))
+    im = plt.imshow(mat, cmap=CFG["CMAP"])
+    plt.title(title)
+    plt.xlabel("Predicted class")
+    plt.ylabel("True class")
+    plt.xticks(range(len(classes)), classes)
+    plt.yticks(range(len(classes)), classes)
+    cbar = plt.colorbar(im)
+    cbar.set_label(label)
+
+    max_val = mat.max() if mat.size else 0
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            val = mat[i, j]
+            text = fmt.format(val) if normalize else fmt.format(int(val))
+            plt.text(j, i, text, ha="center", va="center", fontsize=10,
+                     color="white" if max_val > 0 and val > max_val * 0.6 else "black")
+
+    plt.tight_layout()
+    savefig(out_png)
+    plt.show()
+
+
+def plot_roc_pr(y, p, classes, prefix, out_dir):
+    y_oh = onehot(y, len(classes))
+
+    plt.figure(figsize=(6, 5))
+    for i, c in enumerate(classes):
+        if len(np.unique(y_oh[:, i])) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(y_oh[:, i], p[:, i])
+        auc_i = roc_auc_score(y_oh[:, i], p[:, i])
+        plt.plot(fpr, tpr, label=f"{c} AUC={auc_i:.3f}")
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Chance")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title(f"{prefix} — ROC")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_roc_1000dpi.png"))
+    plt.show()
+
+    plt.figure(figsize=(6, 5))
+    for i, c in enumerate(classes):
+        if len(np.unique(y_oh[:, i])) < 2:
+            continue
+        prec, rec, _ = precision_recall_curve(y_oh[:, i], p[:, i])
+        ap_i = average_precision_score(y_oh[:, i], p[:, i])
+        plt.plot(rec, prec, label=f"{c} AP={ap_i:.3f}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"{prefix} — Precision-Recall")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_pr_1000dpi.png"))
+    plt.show()
+
+
+def plot_reliability(y, p, prefix, out_dir):
+    conf = p.max(axis=1)
+    pred = p.argmax(axis=1)
+    correct = (pred == y).astype(np.float32)
+    bins = CFG["ECE_BINS"]
+    edges = np.linspace(0.0, 1.0, bins + 1)
+
+    bin_acc, bin_conf = [], []
+    for i in range(bins):
+        lo, hi = edges[i], edges[i + 1]
+        mask = (conf >= lo) & (conf < hi) if i < bins - 1 else (conf >= lo) & (conf <= hi)
+        if np.any(mask):
+            bin_acc.append(float(correct[mask].mean()))
+            bin_conf.append(float(conf[mask].mean()))
+        else:
+            bin_acc.append(np.nan)
+            bin_conf.append((lo + hi) / 2)
+
+    ece, mce = compute_ece(conf, correct, bins=bins)
+
+    plt.figure(figsize=(6, 5))
+    plt.plot([0, 1], [0, 1], linestyle="--", label="Ideal")
+    plt.plot(bin_conf, bin_acc, marker="o", label=f"Model ECE={ece:.3f}, MCE={mce:.3f}")
+    plt.xlabel("Confidence")
+    plt.ylabel("Accuracy")
+    plt.title(f"{prefix} — Reliability")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_reliability_1000dpi.png"))
+    plt.show()
+
+    plt.figure(figsize=(6, 4))
+    plt.hist(conf, bins=20)
+    plt.xlabel("Prediction confidence")
+    plt.ylabel("Count")
+    plt.title(f"{prefix} — Confidence histogram")
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_confidence_hist_1000dpi.png"))
+    plt.show()
+
+
+def plot_decision_curve_ovr(y, p, classes, prefix, out_dir):
+    y_oh = onehot(y, len(classes))
+    thresholds = np.linspace(0.01, 0.99, 99)
+
+    plt.figure(figsize=(7, 5))
+    for i, c in enumerate(classes):
+        yt = y_oh[:, i].astype(int)
+        pt = p[:, i]
+        nb = []
+        n = len(yt)
+        for t in thresholds:
+            pred_pos = (pt >= t).astype(int)
+            tp = np.sum((pred_pos == 1) & (yt == 1))
+            fp = np.sum((pred_pos == 1) & (yt == 0))
+            nb.append((tp / n) - (fp / n) * (t / (1 - t)))
+        plt.plot(thresholds, nb, label=c)
+
+    plt.plot(thresholds, np.zeros_like(thresholds), linestyle="--", label="Treat none")
+    prev = y_oh.mean(axis=0)
+    nb_all_macro = []
+    for t in thresholds:
+        vals = [pi - (1 - pi) * (t / (1 - t)) for pi in prev]
+        nb_all_macro.append(np.mean(vals))
+    plt.plot(thresholds, nb_all_macro, linestyle=":", label="Treat all macro")
+    plt.xlabel("Threshold probability")
+    plt.ylabel("Net benefit")
+    plt.title(f"{prefix} — Decision curve")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_decision_curve_1000dpi.png"))
+    plt.show()
+
+
+def plot_training_curves(history, out_dir, prefix):
+    epochs = [e["epoch"] for e in history.get("epochs", [])]
+    if not epochs:
+        return
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs, [e["train_loss"] for e in history["epochs"]], label="Train loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"{prefix} — Loss")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_loss_curve_1000dpi.png"))
+    plt.show()
+
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs, [e["val_macro_f1"] for e in history["epochs"]], label="Val macro-F1")
+    plt.xlabel("Epoch")
+    plt.ylabel("Macro-F1")
+    plt.title(f"{prefix} — Validation macro-F1")
+    plt.legend()
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_val_macro_f1_1000dpi.png"))
+    plt.show()
+
+
+def plot_per_class_bar(perclass_csv, prefix, out_dir):
+    df = pd.read_csv(perclass_csv)
+    metrics = ["Sensitivity_Recall", "Specificity", "Precision_PPV", "F1", "AUROC_OvR", "AUPRC_AP_OvR"]
+    for m in metrics:
+        if m not in df.columns:
+            continue
+        plt.figure(figsize=(6, 4))
+        plt.bar(df["Class"], df[m])
+        plt.ylim(0, 1)
+        plt.ylabel(m)
+        plt.title(f"{prefix} — {m}")
+        for i, v in enumerate(df[m].values):
+            if pd.notna(v):
+                plt.text(i, min(float(v) + 0.02, 1.0), f"{v:.2f}", ha="center", fontsize=9)
+        plt.tight_layout()
+        savefig(os.path.join(out_dir, f"{prefix}_{m}_bar_1000dpi.png"))
+        plt.show()
+
+
+def bootstrap_ci(y, p, classes, out_dir, prefix):
+    rng = np.random.RandomState(CFG["BOOTSTRAP_SEED"])
+    idx = np.arange(len(y))
+    y_oh = onehot(y, len(classes))
+    stats = defaultdict(list)
+
+    for _ in range(CFG["BOOTSTRAP_N"]):
+        samp = rng.choice(idx, size=len(idx), replace=True)
+        ys = y[samp]
+        ps = p[samp]
+        pred = ps.argmax(axis=1)
+        stats["accuracy"].append(accuracy_score(ys, pred))
+        stats["balanced_accuracy"].append(balanced_accuracy_score(ys, pred))
+        stats["macro_f1"].append(f1_score(ys, pred, average="macro", zero_division=0))
+        stats["weighted_f1"].append(f1_score(ys, pred, average="weighted", zero_division=0))
+        stats["mcc"].append(matthews_corrcoef(ys, pred))
+        stats["cohen_kappa"].append(cohen_kappa_score(ys, pred))
+        aucm, _ = safe_auc_ovr(y_oh[samp], ps)
+        apm, _ = safe_ap_ovr(y_oh[samp], ps)
+        stats["auc_ovr_macro"].append(aucm)
+        stats["ap_ovr_macro"].append(apm)
+
+    ci = {}
+    for key, arr in stats.items():
+        arr = np.asarray(arr, dtype=np.float64)
+        ci[key] = {
+            "mean": finite_float(np.nanmean(arr)),
+            "std": finite_float(np.nanstd(arr)),
+            "ci95_low": finite_float(np.nanpercentile(arr, 2.5)),
+            "ci95_high": finite_float(np.nanpercentile(arr, 97.5)),
+        }
+        plt.figure(figsize=(6, 4))
+        plt.hist(arr[~np.isnan(arr)], bins=30)
+        plt.xlabel(key)
+        plt.ylabel("Bootstrap count")
+        plt.title(f"{prefix} bootstrap — {key}")
+        plt.tight_layout()
+        savefig(os.path.join(out_dir, f"{prefix}_bootstrap_{key}_1000dpi.png"))
+        plt.show()
+
+    jdump(ci, os.path.join(out_dir, f"{prefix}_bootstrap_ci95.json"))
+    np.save(os.path.join(out_dir, f"{prefix}_bootstrap_raw.npy"), dict(stats), allow_pickle=True)
+    return ci
+
+
+def full_eval_and_plots(y, p, ids, paths, classes, prefix, run_dir):
+    plots_dir = os.path.join(run_dir, "plots")
+    tables_dir = os.path.join(run_dir, "tables")
+    ensure_dir(plots_dir)
+    ensure_dir(tables_dir)
+
+    metrics = metrics_from_probs(y, p, classes)
+    jdump(metrics, os.path.join(run_dir, f"{prefix}_metrics.json"))
+
+    cm = np.array(metrics["confusion_matrix"], dtype=int)
+    plot_confusion(cm, classes, f"{prefix} — Confusion matrix", os.path.join(plots_dir, f"{prefix}_cm_raw_1000dpi.png"), normalize=False)
+    plot_confusion(cm, classes, f"{prefix} — Normalized confusion matrix", os.path.join(plots_dir, f"{prefix}_cm_norm_1000dpi.png"), normalize=True)
+    plot_roc_pr(y, p, classes, prefix, plots_dir)
+    plot_reliability(y, p, prefix, plots_dir)
+    plot_decision_curve_ovr(y, p, classes, prefix, plots_dir)
+
+    perclass_csv = os.path.join(tables_dir, f"{prefix}_per_class_metrics.csv")
+    export_per_class_table(metrics, classes, perclass_csv)
+    plot_per_class_bar(perclass_csv, prefix, plots_dir)
+    export_prediction_table(y, p, ids, paths, classes, os.path.join(tables_dir, f"{prefix}_predictions.csv"))
+
+    ci = bootstrap_ci(y, p, classes, plots_dir, prefix)
+
+    report = classification_report(y, p.argmax(axis=1), target_names=classes, zero_division=0)
+    with open(os.path.join(tables_dir, f"{prefix}_classification_report.txt"), "w") as f:
+        f.write(report)
+
+    return metrics, ci
+
+
+# =============================================================================
+# B4) DATA LOADING AND 2.5D INPUT
+# =============================================================================
+
+def load_split_csvs(data_root):
+    meta_dir = os.path.join(data_root, "metadata_for_sectionB")
+    p_tr_25 = os.path.join(meta_dir, "train_2p5d_metadata.csv")
+    p_va_25 = os.path.join(meta_dir, "val_2p5d_metadata.csv")
+    p_te_25 = os.path.join(meta_dir, "test_2p5d_metadata.csv")
+
+    if CFG["USE_2P5D_METADATA"] and all(os.path.exists(p) for p in [p_tr_25, p_va_25, p_te_25]):
+        print("✅ Loading Section-A 2.5D metadata.")
+        return pd.read_csv(p_tr_25), pd.read_csv(p_va_25), pd.read_csv(p_te_25)
+
+    print("⚠️ 2.5D metadata not found. Falling back to single-image CSVs.")
+    p_tr = os.path.join(data_root, "train", "train_metadata.csv")
+    p_va = os.path.join(data_root, "val", "val_metadata.csv")
+    p_te = os.path.join(data_root, "test", "test_metadata.csv")
+    assert os.path.exists(p_tr) and os.path.exists(p_va) and os.path.exists(p_te), "Missing Section-A CSVs."
+    tr, va, te = pd.read_csv(p_tr), pd.read_csv(p_va), pd.read_csv(p_te)
+
+    for df in [tr, va, te]:
+        if "CASE_ID" not in df.columns:
+            df["CASE_ID"] = df["Class"].astype(str) + "|" + df["Patient_ID"].astype(str)
+        if "Slice_Index" not in df.columns:
+            df["Slice_Index"] = df["Image_Path"].str.extract(r"_s(\d{4})").astype(int)
+        df["Prev_Image_Path"] = df["Image_Path"]
+        df["Center_Image_Path"] = df["Image_Path"]
+        df["Next_Image_Path"] = df["Image_Path"]
+        df["Center_Slice_Index"] = df["Slice_Index"]
+
+    return tr, va, te
+
+
+def load_norm_stats():
+    if CFG["NORM_MODE"] == "sectionA":
+        p = os.path.join(CFG["DATA_ROOT"], "train_mean_std.json")
+        if os.path.exists(p):
+            js = jload(p)
+            return np.array(js["mean"], dtype=np.float32), np.array(js["std"], dtype=np.float32)
+    return np.array(CFG["IMAGENET_MEAN"], dtype=np.float32), np.array(CFG["IMAGENET_STD"], dtype=np.float32)
+
+
+NORM_MEAN, NORM_STD = load_norm_stats()
+print("✅ Normalization mean:", NORM_MEAN)
+print("✅ Normalization std :", NORM_STD)
+
+
+def read_gray_resized(path, img_size):
+    im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if im is None:
+        raise RuntimeError(f"Unreadable image: {path}")
+    if im.ndim == 2:
+        gray = im
+    elif im.ndim == 3 and im.shape[2] == 4:
+        rgb = cv2.cvtColor(im, cv2.COLOR_BGRA2RGB)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    else:
+        rgb = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.resize(gray, (img_size, img_size), interpolation=cv2.INTER_AREA)
+    return gray.astype(np.float32) / 255.0
+
+
+def read_rgb_resized(path, img_size):
+    im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if im is None:
+        raise RuntimeError(f"Unreadable image: {path}")
+    if im.ndim == 2:
+        im = cv2.cvtColor(im, cv2.COLOR_GRAY2RGB)
+    elif im.ndim == 3 and im.shape[2] == 4:
+        im = cv2.cvtColor(im, cv2.COLOR_BGRA2RGB)
+    else:
+        im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
+    im = cv2.resize(im, (img_size, img_size), interpolation=cv2.INTER_AREA)
+    return im.astype(np.float32) / 255.0
+
+
+def row_to_2p5d_tensor(row, img_size):
+    prev_p = row.get("Prev_Image_Path", row.get("Image_Path"))
+    cen_p = row.get("Center_Image_Path", row.get("Image_Path"))
+    next_p = row.get("Next_Image_Path", row.get("Image_Path"))
+
+    if CFG["USE_GRAYSCALE_2P5D"]:
+        prev = read_gray_resized(prev_p, img_size)
+        cen = read_gray_resized(cen_p, img_size)
+        nxt = read_gray_resized(next_p, img_size)
+        im = np.stack([prev, cen, nxt], axis=-1)
+    else:
+        im = read_rgb_resized(cen_p, img_size)
+
+    mean = NORM_MEAN.reshape(1, 1, 3).astype(np.float32)
+    std = np.clip(NORM_STD.reshape(1, 1, 3).astype(np.float32), 1e-6, None)
+    im = (im.astype(np.float32) - mean) / std
+    im = np.nan_to_num(im, nan=0.0, posinf=5.0, neginf=-5.0)
+    im = np.clip(im, -8.0, 8.0)
+    return torch.from_numpy(im).permute(2, 0, 1).contiguous().float()
+
+
+
+class TwoPointFiveDDataset(Dataset):
+    def __init__(self, df, img_size):
+        self.df = stable_sort_df(df).reset_index(drop=True)
+        self.img_size = img_size
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        r = self.df.iloc[idx]
+        x = row_to_2p5d_tensor(r, self.img_size)
+        y = CLASS_TO_IDX[str(r["Class"])]
+        cid = str(r["CASE_ID"]) if "CASE_ID" in r else f"{r['Class']}|{r['Patient_ID']}"
+        path = str(r.get("Center_Image_Path", r.get("Image_Path")))
+        slice_index = int(r.get("Center_Slice_Index", r.get("Slice_Index", -1)))
+        return x, y, cid, path, slice_index
+
+
+def worker_init_fn(worker_id):
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed + worker_id)
+    random.seed(seed + worker_id)
+
+
+def make_loader(ds, batch_size, shuffle, seed):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=CFG["NUM_WORKERS"],
+        pin_memory=CFG["PIN_MEMORY"],
+        worker_init_fn=worker_init_fn,
+        generator=g,
+    )
+
+
+# =============================================================================
+# B5) MODELS AND LOSSES
+# =============================================================================
+
+def resolve_backbone(name):
+    """Resolve a timm model name without triggering Hugging Face downloads."""
+    models = timm.list_models(pretrained=False)
+
+    if name in models:
+        return name
+
+    # Use architecture-only model names first. Avoid *.ms_in1k names when offline.
+    aliases = [
+        name,
+        "swin_tiny_patch4_window7_224",
+        "convnext_tiny",
+        "resnet50",
+    ]
+
+    for m in aliases:
+        if m in models:
+            print(f"⚠️ Backbone resolved: requested={name} → used={m}")
+            return m
+
+    for key in ["swin_tiny", "swin", "convnext", "resnet50"]:
+        cand = [m for m in models if key in m]
+        if cand:
+            print(f"⚠️ Backbone resolved by keyword: requested={name} → used={cand[0]}")
+            return cand[0]
+
+    raise RuntimeError(f"No compatible timm backbone found for: {name}")
+
+
+def build_classifier(backbone_name, num_classes):
+    resolved = resolve_backbone(backbone_name)
+    use_pretrained = bool(CFG.get("USE_PRETRAINED_BACKBONE", False))
+    try:
+        model = timm.create_model(resolved, pretrained=use_pretrained, num_classes=num_classes)
+        print(f"✅ Created backbone: {resolved} | pretrained={use_pretrained}")
+    except Exception as e:
+        if use_pretrained:
+            print(f"⚠️ Pretrained download/load failed for {resolved}: {e}")
+            print("⚠️ Falling back to pretrained=False so Kaggle offline run can continue.")
+            model = timm.create_model(resolved, pretrained=False, num_classes=num_classes)
+        else:
+            raise
+    return model, resolved
+
+
+def build_feature_extractor(backbone_resolved, trained_slice_ckpt, device):
+    # Important: pretrained=False prevents a second Hugging Face download attempt.
+    # The feature extractor is initialized from the trained slice checkpoint below.
+    feat_model = timm.create_model(backbone_resolved, pretrained=False, num_classes=0, global_pool="avg")
+    if os.path.exists(trained_slice_ckpt):
+        st = safe_torch_load(trained_slice_ckpt, map_location="cpu")
+        state = st["model"] if isinstance(st, dict) and "model" in st else st
+        missing, unexpected = feat_model.load_state_dict(state, strict=False)
+        print(f"✅ Loaded slice weights into feature extractor. Missing={len(missing)}, unexpected={len(unexpected)}")
+    else:
+        print("⚠️ Slice checkpoint not found; using randomly initialized feature extractor.")
+    feat_model.to(device)
+    feat_model.eval()
+    return feat_model
+
+
+class CurriculumFocalLoss(nn.Module):
+    def __init__(self, class_weights=None, gamma_max=2.0, warmup_epochs=8):
+        super().__init__()
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights)
+        else:
+            self.class_weights = None
+        self.gamma_max = float(gamma_max)
+        self.warmup_epochs = max(1, int(warmup_epochs))
+
+    def forward(self, logits, target, epoch):
+        # Clamp before log-softmax to avoid AMP/overflow instability.
+        logits = torch.nan_to_num(logits.float(), nan=0.0, posinf=50.0, neginf=-50.0)
+        logits = torch.clamp(logits, -50.0, 50.0)
+
+        gamma = self.gamma_max * min(1.0, max(0.0, epoch / self.warmup_epochs))
+        logp = F.log_softmax(logits, dim=1)
+        p = torch.exp(logp)
+        target_logp = logp.gather(1, target.view(-1, 1)).squeeze(1)
+        target_p = p.gather(1, target.view(-1, 1)).squeeze(1).clamp(1e-7, 1.0 - 1e-7)
+        focal = (1.0 - target_p).pow(gamma)
+        loss = -focal * target_logp
+        if self.class_weights is not None:
+            loss = loss * self.class_weights[target]
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=50.0, neginf=0.0)
+        return loss.mean(), gamma
+
+
+
+class PrototypeGuidedAttentionMIL(nn.Module):
+    """
+    Case-level attention MIL with class-associated prototypes.
+
+    x: B,T,D slice features
+    output:
+      logits: fused classifier logits + prototype similarity logits
+      attention weights over slices
+      prototype similarities per class/prototype
+    """
+    def __init__(self, in_dim, hidden_dim, heads, num_classes, prototypes_per_class, drop=0.15, proto_logit_scale=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.prototypes_per_class = prototypes_per_class
+        self.proto_logit_scale = float(proto_logit_scale)
+        self.attn_tau = 0.5
+
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(drop),
+        )
+        self.self_attn = nn.MultiheadAttention(hidden_dim, heads, dropout=drop, batch_first=True)
+        self.score = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+        self.classifier = nn.Linear(hidden_dim, num_classes)
+
+        self.prototypes = nn.Parameter(torch.randn(num_classes, prototypes_per_class, hidden_dim) * 0.02)
+
+    def forward(self, x, key_padding_mask=None, target=None):
+        h = self.proj(x)
+        h2, _ = self.self_attn(h, h, h, key_padding_mask=key_padding_mask, need_weights=False)
+        h = h + h2
+
+        a = self.score(h).squeeze(-1)
+
+        if key_padding_mask is not None:
+            a = a.masked_fill(key_padding_mask, -1e9)
+
+        a_scaled = a / self.attn_tau
+        w = torch.softmax(a_scaled, dim=1)
+        z = torch.sum(h * w.unsqueeze(-1), dim=1)
+
+        cls_logits = self.classifier(z)
+
+        # Prototype similarities: negative squared distance.
+        # z: B,D; prototypes: C,P,D => B,C,P
+        z = torch.nan_to_num(z, nan=0.0, posinf=10.0, neginf=-10.0)
+        proto = torch.nan_to_num(self.prototypes, nan=0.0, posinf=10.0, neginf=-10.0)
+        diff = z[:, None, None, :] - proto[None, :, :, :]
+        dist2 = torch.sum(diff * diff, dim=-1).clamp(0.0, 1e4)
+        proto_sim = -dist2
+        proto_logits = proto_sim.max(dim=2).values
+        logits = cls_logits + self.proto_logit_scale * proto_logits
+        logits = torch.clamp(torch.nan_to_num(logits.float(), nan=0.0, posinf=50.0, neginf=-50.0), -50.0, 50.0)
+
+        proto_reg = torch.tensor(0.0, device=x.device)
+        if target is not None:
+            # Cluster: sample should be close to at least one prototype of its own class.
+            own_dist = dist2[torch.arange(z.size(0), device=x.device), target, :]
+            cluster_loss = own_dist.min(dim=1).values.mean()
+
+            # Separation: class prototypes should not collapse together.
+            flat = self.prototypes.reshape(self.num_classes * self.prototypes_per_class, -1)
+            pdist = torch.cdist(flat, flat, p=2)
+            eye = torch.eye(pdist.shape[0], device=x.device).bool()
+            sep_loss = torch.exp(-pdist[~eye]).mean()
+
+            proto_reg = CFG["PROTO_CLUSTER_LAMBDA"] * cluster_loss + CFG["PROTO_SEPARATION_LAMBDA"] * sep_loss
+
+        return logits, w, proto_sim, proto_reg
+
+
+# =============================================================================
+# B6) SLICE TRAINING AND EVALUATION
+# =============================================================================
+
+@torch.no_grad()
+def eval_slice_model(model, loader, device):
+    model.eval()
+    all_y, all_p, all_case, all_paths, all_slice_idx = [], [], [], [], []
+    for x, y, cid, path, slice_idx in loader:
+        x = x.to(device, non_blocking=True)
+        x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+        logits = model(x).float().detach().cpu().numpy()
+        all_p.append(softmax_np(logits))
+        all_y.append(np.asarray(y, dtype=np.int64))
+        all_case += list(cid)
+        all_paths += list(path)
+        all_slice_idx += [int(s) for s in slice_idx]
+    return {
+        "y": np.concatenate(all_y),
+        "p": sanitize_probs_np(np.vstack(all_p), num_classes=len(CFG["CLASSES"]), context="eval_slice_model"),
+        "case_ids": all_case,
+        "paths": all_paths,
+        "slice_indices": all_slice_idx,
+    }
+
+
+
+def train_slice_one_epoch(model, loader, opt, scaler, loss_fn, device, epoch):
+    model.train()
+    total_loss, n = 0.0, 0
+    gamma_last = 0.0
+    skipped = 0
+
+    for x, y, *_ in loader:
+        x = x.to(device, non_blocking=True)
+        x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+        y = torch.as_tensor(y, dtype=torch.long, device=device)
+        opt.zero_grad(set_to_none=True)
+
+        with cuda_autocast(enabled=(CFG["AMP_SLICE"] and device.type == "cuda")):
+            logits = model(x)
+            if not torch.isfinite(logits).all():
+                skipped += 1
+                print(f"⚠️ Slice epoch {epoch}: skipped batch with non-finite logits.")
+                continue
+            if CFG["USE_CURRICULUM_FOCAL"]:
+                loss, gamma_last = loss_fn(logits, y, epoch)
+            else:
+                safe_logits = torch.clamp(torch.nan_to_num(logits.float(), nan=0.0, posinf=50.0, neginf=-50.0), -50.0, 50.0)
+                loss = F.cross_entropy(safe_logits, y, weight=loss_fn.class_weights)
+                gamma_last = 0.0
+
+        if not torch.isfinite(loss):
+            skipped += 1
+            print(f"⚠️ Slice epoch {epoch}: skipped batch with non-finite loss.")
+            continue
+
+        if CFG["AMP_SLICE"] and device.type == "cuda":
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.get("GRAD_CLIP_NORM", 1.0))
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.get("GRAD_CLIP_NORM", 1.0))
+            opt.step()
+
+        bs = x.size(0)
+        total_loss += float(loss.detach().cpu()) * bs
+        n += bs
+
+    if skipped > 0:
+        print(f"⚠️ Slice epoch {epoch}: skipped {skipped} unstable batches.")
+    return total_loss / max(1, n), float(gamma_last)
+
+
+
+def compute_class_weights(df_train, device):
+    counts = df_train["Class"].value_counts().reindex(CFG["CLASSES"], fill_value=0).values.astype(np.float32)
+    weights = counts.sum() / np.clip(counts, 1, None)
+    weights = weights / np.mean(weights)
+    d = {c: float(w) for c, w in zip(CFG["CLASSES"], weights)}
+    print("✅ Class weights:", d)
+    if CFG["USE_CLASS_WEIGHTS"]:
+        return torch.tensor(weights, dtype=torch.float32, device=device), d
+    return None, d
+
+
+def aggregate_case_meanprob(slice_y, slice_p, case_ids, max_slices, seed):
+    rng = np.random.RandomState(seed)
+    slice_y = np.asarray(slice_y, dtype=np.int64)
+    slice_p = sanitize_probs_np(slice_p, num_classes=len(CFG["CLASSES"]), context="aggregate_case_meanprob")
+    grouped = defaultdict(list)
+    for i, cid in enumerate(case_ids):
+        grouped[str(cid)].append(i)
+    case_y, case_p, case_list = [], [], []
+    for cid in sorted(grouped.keys()):
+        idxs = grouped[cid]
+        y_case = int(np.bincount(slice_y[idxs], minlength=len(CFG["CLASSES"])).argmax())
+        if len(idxs) > max_slices:
+            idxs = list(rng.choice(idxs, size=max_slices, replace=False))
+        pp = slice_p[idxs].mean(axis=0)
+        pp = sanitize_probs_np(pp.reshape(1, -1), num_classes=len(CFG["CLASSES"]), context=f"case_meanprob_{cid}")[0]
+        case_y.append(y_case)
+        case_p.append(pp)
+        case_list.append(cid)
+    return np.array(case_y, dtype=np.int64), sanitize_probs_np(np.vstack(case_p), len(CFG["CLASSES"]), "case_meanprob_output"), case_list
+
+# =============================================================================
+# B7) FEATURE EXTRACTION AND PG-MIL DATASET
+# =============================================================================
+
+@torch.no_grad()
+def extract_features(feat_model, loader, device):
+    feat_model.eval()
+    feats, ys, cids, paths, slice_indices = [], [], [], [], []
+    for x, y, cid, path, slice_idx in loader:
+        x = x.to(device, non_blocking=True)
+        x = torch.nan_to_num(x, nan=0.0, posinf=5.0, neginf=-5.0)
+        f = feat_model(x).float().detach().cpu().numpy()
+        if not np.all(np.isfinite(f)):
+            print("⚠️ extract_features: non-finite features replaced with zero.")
+            f = np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0)
+        feats.append(f.astype(np.float32))
+        ys.append(np.asarray(y, dtype=np.int64))
+        cids += list(cid)
+        paths += list(path)
+        slice_indices += [int(s) for s in slice_idx]
+    return {
+        "feats": np.vstack(feats).astype(np.float32),
+        "y": np.concatenate(ys),
+        "case_ids": cids,
+        "paths": paths,
+        "slice_indices": slice_indices,
+    }
+
+
+
+def save_feature_npz(obj, path):
+    ensure_dir(os.path.dirname(path))
+    np.savez_compressed(
+        path,
+        feats=obj["feats"],
+        y=obj["y"],
+        case_ids=np.array(obj["case_ids"], dtype=object),
+        paths=np.array(obj["paths"], dtype=object),
+        slice_indices=np.array(obj["slice_indices"], dtype=np.int32),
+    )
+
+
+def load_feature_npz(path):
+    z = np.load(path, allow_pickle=True)
+    return {
+        "feats": z["feats"],
+        "y": z["y"],
+        "case_ids": list(z["case_ids"]),
+        "paths": list(z["paths"]),
+        "slice_indices": list(z["slice_indices"]),
+    }
+
+
+class BagFeatureDataset(Dataset):
+    def __init__(self, feat_obj, max_slices, seed, train):
+        self.feats = feat_obj["feats"]
+        self.y = feat_obj["y"]
+        self.case_ids = [str(c) for c in feat_obj["case_ids"]]
+        self.paths = feat_obj["paths"]
+        self.slice_indices = feat_obj["slice_indices"]
+        self.max_slices = max_slices
+        self.seed = seed
+        self.train = train
+        self.epoch = 0
+        self.case_map = defaultdict(list)
+        for i, cid in enumerate(self.case_ids):
+            self.case_map[cid].append(i)
+        self.cases = sorted(self.case_map.keys())
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.cases)
+
+    def __getitem__(self, idx):
+        cid = self.cases[idx]
+        idxs = self.case_map[cid]
+        idxs = sorted(idxs, key=lambda i: self.slice_indices[i])
+        y_case = int(np.bincount(self.y[idxs]).argmax())
+
+        rng = np.random.RandomState(self.seed + self.epoch * 1000 + idx)
+        if self.train and len(idxs) > self.max_slices:
+            idxs = list(rng.choice(idxs, size=self.max_slices, replace=False))
+            idxs = sorted(idxs, key=lambda i: self.slice_indices[i])
+        elif len(idxs) > self.max_slices:
+            start = max(0, (len(idxs) - self.max_slices) // 2)
+            idxs = idxs[start:start + self.max_slices]
+
+        x = self.feats[idxs]
+        paths = [self.paths[i] for i in idxs]
+        slice_idxs = [int(self.slice_indices[i]) for i in idxs]
+        return torch.from_numpy(x).float(), y_case, cid, paths, slice_idxs
+
+
+def pad_collate_bags(batch):
+    xs, ys, cids, paths_list, sliceidx_list = zip(*batch)
+    lens = [x.shape[0] for x in xs]
+    max_len = max(lens)
+    d = xs[0].shape[1]
+    X = torch.zeros((len(xs), max_len, d), dtype=torch.float32)
+    pad_mask = torch.ones((len(xs), max_len), dtype=torch.bool)
+    for i, x in enumerate(xs):
+        t = x.shape[0]
+        X[i, :t] = x
+        pad_mask[i, :t] = False
+    Y = torch.tensor(ys, dtype=torch.long)
+    return X, Y, list(cids), list(paths_list), list(sliceidx_list), pad_mask
+
+
+def make_bag_loader(ds, batch_size, shuffle, seed):
+    g = torch.Generator()
+    g.manual_seed(seed)
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=pad_collate_bags, generator=g)
+
+
+def run_pg_mil_epoch(model, loader, opt, scaler, loss_fn, device, epoch, train):
+    model.train() if train else model.eval()
+    total_loss, n = 0.0, 0
+    all_y, all_p, all_case = [], [], []
+    attn_rows, proto_rows = [], []
+    gamma_last = 0.0
+    skipped = 0
+
+    for X, Y, cids, paths_list, sliceidx_list, pad_mask in loader:
+        X = X.to(device, non_blocking=True)
+        X = torch.nan_to_num(X, nan=0.0, posinf=10.0, neginf=-10.0)
+        Y = Y.to(device, non_blocking=True)
+        pad_mask = pad_mask.to(device, non_blocking=True)
+
+        if train:
+            opt.zero_grad(set_to_none=True)
+
+        with torch.set_grad_enabled(train):
+            with cuda_autocast(enabled=(CFG["AMP_CASE"] and device.type == "cuda")):
+                logits, attn, proto_sim, proto_reg = model(X, key_padding_mask=pad_mask, target=Y)
+                if not torch.isfinite(logits).all():
+                    skipped += 1
+                    print(f"⚠️ PG-MIL epoch {epoch}: skipped batch with non-finite logits.")
+                    continue
+                if CFG["USE_CURRICULUM_FOCAL"]:
+                    cls_loss, gamma_last = loss_fn(logits, Y, epoch)
+                else:
+                    safe_logits = torch.clamp(torch.nan_to_num(logits.float(), nan=0.0, posinf=50.0, neginf=-50.0), -50.0, 50.0)
+                    cls_loss = F.cross_entropy(safe_logits, Y, weight=loss_fn.class_weights)
+                    gamma_last = 0.0
+                loss = cls_loss + torch.nan_to_num(proto_reg, nan=0.0, posinf=0.0, neginf=0.0)
+
+            if train:
+                if not torch.isfinite(loss):
+                    skipped += 1
+                    print(f"⚠️ PG-MIL epoch {epoch}: skipped batch with non-finite loss.")
+                    continue
+                if CFG["AMP_CASE"] and device.type == "cuda":
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.get("GRAD_CLIP_NORM", 1.0))
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), CFG.get("GRAD_CLIP_NORM", 1.0))
+                    opt.step()
+
+        bs = X.size(0)
+        total_loss += float(torch.nan_to_num(loss.detach().cpu(), nan=0.0, posinf=0.0, neginf=0.0)) * bs
+        n += bs
+
+        pp = softmax_np(logits.float().detach().cpu().numpy())
+        aa = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0).detach().cpu().numpy()
+        psim = torch.nan_to_num(proto_sim, nan=0.0, posinf=0.0, neginf=0.0).detach().cpu().numpy()
+
+        all_y.append(Y.detach().cpu().numpy())
+        all_p.append(pp)
+        all_case += cids
+
+        for b, cid in enumerate(cids):
+            valid_len = int((~pad_mask[b]).sum().detach().cpu())
+            for j in range(valid_len):
+                attn_rows.append({
+                    "CASE_ID": cid,
+                    "Slice_Index": int(sliceidx_list[b][j]),
+                    "Image_Path": paths_list[b][j],
+                    "Attention_Weight": float(aa[b, j]),
+                })
+            for ci, cls in enumerate(CFG["CLASSES"]):
+                for pi in range(CFG["PROTOTYPES_PER_CLASS"]):
+                    proto_rows.append({
+                        "CASE_ID": cid,
+                        "Class_Prototype": cls,
+                        "Prototype_Index": int(pi),
+                        "Similarity": float(psim[b, ci, pi]),
+                    })
+
+    if skipped > 0:
+        print(f"⚠️ PG-MIL epoch {epoch}: skipped {skipped} unstable batches.")
+
+    p_out = sanitize_probs_np(np.vstack(all_p), len(CFG["CLASSES"]), "run_pg_mil_epoch") if all_p else np.empty((0, len(CFG["CLASSES"])))
+    return {
+        "loss": total_loss / max(1, n),
+        "y": np.concatenate(all_y) if all_y else np.array([]),
+        "p": p_out,
+        "case_ids": all_case,
+        "attn_rows": attn_rows,
+        "proto_rows": proto_rows,
+        "gamma": float(gamma_last),
+    }
+
+
+
+def plot_top_attention(attn_csv, out_dir, top_cases=6):
+    if not os.path.exists(attn_csv):
+        return
+    df = pd.read_csv(attn_csv)
+    if df.empty:
+        return
+    for cid in sorted(df["CASE_ID"].unique())[:top_cases]:
+        g = df[df["CASE_ID"] == cid].sort_values("Slice_Index")
+        plt.figure(figsize=(7, 4))
+        plt.bar(g["Slice_Index"].astype(str), g["Attention_Weight"])
+        plt.xticks(rotation=90)
+        plt.xlabel("Slice index")
+        plt.ylabel("Attention weight")
+        plt.title(f"PG-MIL attention over slices — {cid}")
+        plt.tight_layout()
+        safe_cid = str(cid).replace("|", "_").replace("/", "_")
+        savefig(os.path.join(out_dir, f"pgmil_attention_{safe_cid}_1000dpi.png"))
+        plt.show()
+
+
+def plot_prototype_summary(proto_csv, out_dir, prefix):
+    if not os.path.exists(proto_csv):
+        return
+    df = pd.read_csv(proto_csv)
+    if df.empty:
+        return
+    pivot = df.groupby(["CASE_ID", "Class_Prototype"])["Similarity"].max().reset_index()
+    mean_sim = pivot.groupby("Class_Prototype")["Similarity"].mean().reindex(CFG["CLASSES"])
+    plt.figure(figsize=(6, 4))
+    plt.bar(mean_sim.index, mean_sim.values)
+    plt.ylabel("Mean max prototype similarity")
+    plt.title(f"{prefix} — Prototype similarity summary")
+    plt.tight_layout()
+    savefig(os.path.join(out_dir, f"{prefix}_prototype_similarity_summary_1000dpi.png"))
+    plt.show()
+
+
+# =============================================================================
+# B8) PER-SEED RUN
+# =============================================================================
+
+def run_one_seed(seed):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n==================== SEED {seed} | device={device.type} ====================")
+    seed_everything(seed, CFG["DETERMINISTIC"], CFG["DETERMINISTIC_WARN_ONLY"])
+
+    run_dir = os.path.join(CFG["RUN_ROOT"], "runs", f"seed{seed}")
+    plots_dir = os.path.join(run_dir, "plots")
+    tables_dir = os.path.join(run_dir, "tables")
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    ensure_dir(plots_dir)
+    ensure_dir(tables_dir)
+    ensure_dir(ckpt_dir)
+
+    done_path = os.path.join(run_dir, "DONE.json")
+    if os.path.exists(done_path):
+        print("✅ Seed already complete. Reusing DONE.json")
+        return jload(done_path)
+
+    df_tr, df_va, df_te = load_split_csvs(CFG["DATA_ROOT"])
+    df_tr, df_va, df_te = stable_sort_df(df_tr), stable_sort_df(df_va), stable_sort_df(df_te)
+
+    split_counts = {}
+    for name, df in [("train", df_tr), ("val", df_va), ("test", df_te)]:
+        split_counts[name] = {
+            "slices": int(len(df)),
+            "cases": int(df["CASE_ID"].nunique()),
+            "per_class_slices": df["Class"].value_counts().reindex(CFG["CLASSES"], fill_value=0).to_dict(),
+            "per_class_cases": df.groupby("Class")["CASE_ID"].nunique().reindex(CFG["CLASSES"], fill_value=0).to_dict(),
+        }
+    jdump(split_counts, os.path.join(run_dir, "data_split_counts.json"))
+
+    ds_tr = TwoPointFiveDDataset(df_tr, CFG["IMG_SIZE"])
+    ds_va = TwoPointFiveDDataset(df_va, CFG["IMG_SIZE"])
+    ds_te = TwoPointFiveDDataset(df_te, CFG["IMG_SIZE"])
+
+    dl_tr = make_loader(ds_tr, CFG["SLICE_BATCH"], True, seed)
+    dl_va = make_loader(ds_va, CFG["SLICE_BATCH"], False, seed)
+    dl_te = make_loader(ds_te, CFG["SLICE_BATCH"], False, seed)
+
+    class_weights, class_weight_dict = compute_class_weights(df_tr, device)
+    loss_fn = CurriculumFocalLoss(
+        class_weights,
+        CFG["FOCAL_GAMMA_MAX"],
+        CFG["FOCAL_WARMUP_EPOCHS"]
+    )
+
+    # ----------------------------- Slice 2.5D Swin ---------------------------
+    slice_model, backbone_used = build_classifier(CFG["BACKBONE"], len(CFG["CLASSES"]))
+    slice_model.to(device)
+
+    opt = torch.optim.AdamW(
+        slice_model.parameters(),
+        lr=CFG["SLICE_LR"],
+        weight_decay=CFG["WEIGHT_DECAY"]
+    )
+
+    scaler = GradScaler(enabled=(CFG["AMP_SLICE"] and device.type == "cuda"))
+
+    ckpt_best = os.path.join(ckpt_dir, "slice_best.pt")
+    ckpt_last = os.path.join(ckpt_dir, "slice_last.pt")
+    hist_path = os.path.join(run_dir, "slice_training_history.json")
+    slice_stage_done = os.path.join(run_dir, "SLICE_STAGE_DONE.json")
+
+    history = safe_jload(hist_path, default=None)
+    if not isinstance(history, dict):
+        history = {
+            "seed": seed,
+            "backbone_used": backbone_used,
+            "loss": "curriculum_focal" if CFG["USE_CURRICULUM_FOCAL"] else "cross_entropy",
+            "class_weights": class_weight_dict,
+            "epochs": [],
+        }
+
+    best_val, bad_epochs, start_ep = -1.0, 0, 1
+
+    if CFG.get("RESUME_TRAINING", True) and os.path.exists(slice_stage_done) and os.path.exists(ckpt_best):
+        stage_info = safe_jload(slice_stage_done, default={}) or {}
+        best_val = float(stage_info.get("best_val_macro_f1", -1.0))
+        backbone_used = stage_info.get("backbone_used", backbone_used)
+        print(f"✅ Slice stage already complete for seed {seed}; loading best checkpoint.")
+
+    elif CFG.get("RESUME_TRAINING", True) and os.path.exists(ckpt_last):
+        try:
+            last = safe_torch_load(ckpt_last, map_location="cpu")
+            slice_model.load_state_dict(last["model"])
+
+            if "optimizer" in last and last["optimizer"] is not None:
+                opt.load_state_dict(last["optimizer"])
+                move_optimizer_state_to_device(opt, device)
+
+            if "scaler" in last and last["scaler"] is not None and scaler is not None:
+                scaler.load_state_dict(last["scaler"])
+
+            start_ep = int(last.get("epoch", 0)) + 1
+            best_val = float(last.get("best_val_macro_f1", -1.0))
+            bad_epochs = int(last.get("bad_epochs", 0))
+            backbone_used = last.get("backbone_used", backbone_used)
+
+            if "epochs" in history:
+                history["epochs"] = [
+                    e for e in history["epochs"]
+                    if int(e.get("epoch", 0)) < start_ep
+                ]
+
+            print(
+                f"🔁 Resuming slice training for seed {seed} "
+                f"from epoch {start_ep}/{CFG['SLICE_EPOCHS']} | best_val={best_val:.4f}"
+            )
+
+        except Exception as e:
+            print(f"⚠️ Could not resume slice checkpoint; restarting slice training. Reason: {e}")
+            best_val, bad_epochs, start_ep = -1.0, 0, 1
+
+    if not (os.path.exists(slice_stage_done) and os.path.exists(ckpt_best)):
+        for ep in range(start_ep, CFG["SLICE_EPOCHS"] + 1):
+            train_loss, gamma = train_slice_one_epoch(
+                slice_model,
+                dl_tr,
+                opt,
+                scaler,
+                loss_fn,
+                device,
+                ep
+            )
+
+            va_out = eval_slice_model(slice_model, dl_va, device)
+            va_metrics = metrics_from_probs(va_out["y"], va_out["p"], CFG["CLASSES"])
+            val_macro_f1 = va_metrics["macro_f1"]
+
+            history["epochs"].append({
+                "epoch": ep,
+                "train_loss": float(train_loss),
+                "val_macro_f1": float(val_macro_f1),
+                "val_balanced_accuracy": float(va_metrics["balanced_accuracy"]),
+                "curriculum_gamma": float(gamma),
+            })
+
+            jdump(history, hist_path)
+
+            print(
+                f"[seed{seed}] Slice ep{ep:02d} "
+                f"loss={train_loss:.4f} val_macroF1={val_macro_f1:.4f} gamma={gamma:.3f}"
+            )
+
+            is_best = val_macro_f1 > best_val
+
+            if is_best:
+                best_val = val_macro_f1
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+
+            if CFG.get("SAVE_LAST_EVERY_EPOCH", True):
+                torch.save({
+                    "epoch": ep,
+                    "model": slice_model.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "scaler": scaler.state_dict() if scaler is not None else None,
+                    "best_val_macro_f1": best_val,
+                    "bad_epochs": bad_epochs,
+                    "backbone_used": backbone_used,
+                }, ckpt_last)
+
+            if is_best:
+                shutil.copy2(ckpt_last, ckpt_best)
+
+            if bad_epochs >= CFG["EARLY_STOP_PATIENCE"]:
+                print(f"⏹ Early stopping slice model at epoch {ep}")
+                break
+
+        if not os.path.exists(ckpt_best) and os.path.exists(ckpt_last):
+            shutil.copy2(ckpt_last, ckpt_best)
+
+        jdump({
+            "seed": seed,
+            "stage": "slice_2p5d_training",
+            "status": "complete",
+            "best_val_macro_f1": best_val,
+            "last_epoch": int(history["epochs"][-1]["epoch"]) if history.get("epochs") else None,
+            "backbone_used": backbone_used,
+        }, slice_stage_done)
+
+        print("✅ Slice stage checkpoint complete:", slice_stage_done)
+
+    plot_training_curves(history, plots_dir, f"seed{seed}_slice_2p5d")
+
+    best_state = safe_torch_load(ckpt_best, map_location="cpu")
+    slice_model.load_state_dict(best_state["model"])
+    slice_model.to(device)
+
+    te_out = eval_slice_model(slice_model, dl_te, device)
+
+    slice_metrics, slice_ci = full_eval_and_plots(
+        te_out["y"],
+        te_out["p"],
+        ids=[
+            f"{cid}|s{si}"
+            for cid, si in zip(te_out["case_ids"], te_out["slice_indices"])
+        ],
+        paths=te_out["paths"],
+        classes=CFG["CLASSES"],
+        prefix=f"seed{seed}_slice_2p5d_test",
+        run_dir=run_dir,
+    )
+
+    # ------------------------- Case mean-prob baseline ------------------------
+    case_y, case_p, case_ids = aggregate_case_meanprob(
+        te_out["y"],
+        te_out["p"],
+        te_out["case_ids"],
+        CFG["MAX_SLICES_EVAL"],
+        seed
+    )
+
+    case_mean_metrics, case_mean_ci = full_eval_and_plots(
+        case_y,
+        case_p,
+        ids=case_ids,
+        paths=None,
+        classes=CFG["CLASSES"],
+        prefix=f"seed{seed}_case_meanprob_test",
+        run_dir=run_dir,
+    )
+
+    # ------------------------ Proposed Prototype-Guided MIL -------------------
+    pgmil_metrics, pgmil_ci = None, None
+
+    if CFG["RUN_PG_MIL"]:
+        feat_cache = os.path.join(run_dir, "feature_cache")
+        ensure_dir(feat_cache)
+
+        tr_npz = os.path.join(feat_cache, "train_features.npz")
+        va_npz = os.path.join(feat_cache, "val_features.npz")
+        te_npz = os.path.join(feat_cache, "test_features.npz")
+        cache_info_path = os.path.join(feat_cache, "feature_cache_signature.json")
+
+        # Current feature-cache signature.
+        # This prevents stale features from being reused after slice_best.pt changes.
+        current_sig = feature_cache_signature(ckpt_best, backbone_used)
+        feature_paths = [tr_npz, va_npz, te_npz]
+
+        feat_model = build_feature_extractor(backbone_used, ckpt_best, device)
+        
+        for param in feat_model.parameters():
+            param.requires_grad = False
+
+        if feature_cache_valid(cache_info_path, current_sig, feature_paths):
+            print("✅ Reusing valid cached features matched to current slice checkpoint.")
+
+            tr_feat = load_feature_npz(tr_npz)
+            va_feat = load_feature_npz(va_npz)
+            te_feat = load_feature_npz(te_npz)
+
+        else:
+            print("⚠️ Feature cache missing or stale.")
+            print("🔁 Re-extracting features using current slice_best.pt.")
+
+            for old_p in feature_paths:
+                if os.path.exists(old_p):
+                    os.remove(old_p)
+
+            print("🔁 Extracting train features...")
+            tr_feat = extract_features(feat_model, dl_tr, device)
+            save_feature_npz(tr_feat, tr_npz)
+
+            print("🔁 Extracting validation features...")
+            va_feat = extract_features(feat_model, dl_va, device)
+            save_feature_npz(va_feat, va_npz)
+
+            print("🔁 Extracting test features...")
+            te_feat = extract_features(feat_model, dl_te, device)
+            save_feature_npz(te_feat, te_npz)
+
+            jdump(current_sig, cache_info_path)
+            print("📌 Feature cache signature saved:", cache_info_path)
+
+        in_dim = int(tr_feat["feats"].shape[1])
+        print("✅ Feature dimension for PG-MIL:", in_dim)
+
+        ds_tr_bag = BagFeatureDataset(
+            tr_feat,
+            CFG["MAX_SLICES_TRAIN"],
+            seed,
+            train=True
+        )
+
+        ds_va_bag = BagFeatureDataset(
+            va_feat,
+            CFG["MAX_SLICES_EVAL"],
+            seed,
+            train=False
+        )
+
+        ds_te_bag = BagFeatureDataset(
+            te_feat,
+            CFG["MAX_SLICES_EVAL"],
+            seed,
+            train=False
+        )
+
+        dl_tr_bag = make_bag_loader(ds_tr_bag, CFG["CASE_BATCH"], True, seed)
+        dl_va_bag = make_bag_loader(ds_va_bag, CFG["CASE_BATCH"], False, seed)
+        dl_te_bag = make_bag_loader(ds_te_bag, CFG["CASE_BATCH"], False, seed)
+
+        pgmil = PrototypeGuidedAttentionMIL(
+            in_dim=in_dim,
+            hidden_dim=CFG["FUSE_D"],
+            heads=CFG["FUSE_HEADS"],
+            num_classes=len(CFG["CLASSES"]),
+            prototypes_per_class=CFG["PROTOTYPES_PER_CLASS"],
+            drop=CFG["DROP"],
+            proto_logit_scale=CFG["PROTO_LOGIT_SCALE"],
+        ).to(device)
+
+        opt_p = torch.optim.AdamW(
+            pgmil.parameters(),
+            lr=CFG["CASE_LR"],
+            weight_decay=CFG["WEIGHT_DECAY"]
+        )
+
+        scaler_p = GradScaler(enabled=(CFG["AMP_CASE"] and device.type == "cuda"))
+
+        pg_loss_fn = CurriculumFocalLoss(
+            class_weights,
+            CFG["FOCAL_GAMMA_MAX"],
+            CFG["FOCAL_WARMUP_EPOCHS"]
+        )
+
+        pg_best = os.path.join(ckpt_dir, "pgmil_best.pt")
+        pg_last = os.path.join(ckpt_dir, "pgmil_last.pt")
+        pg_hist_path = os.path.join(run_dir, "pgmil_training_history.json")
+        pg_stage_done = os.path.join(run_dir, "PGMIL_STAGE_DONE.json")
+
+        pg_history = safe_jload(pg_hist_path, default=None)
+        if not isinstance(pg_history, dict):
+            pg_history = {"seed": seed, "epochs": []}
+
+        best_pg, bad_pg, pg_start_ep = -1.0, 0, 1
+
+        if CFG.get("RESUME_TRAINING", True) and os.path.exists(pg_stage_done) and os.path.exists(pg_best):
+            stage_info = safe_jload(pg_stage_done, default={}) or {}
+            best_pg = float(stage_info.get("best_val_macro_f1", -1.0))
+            print(f"✅ PG-MIL stage already complete for seed {seed}; loading best checkpoint.")
+
+        elif CFG.get("RESUME_TRAINING", True) and os.path.exists(pg_last):
+            try:
+                last = safe_torch_load(pg_last, map_location="cpu")
+                pgmil.load_state_dict(last["model"])
+
+                if "optimizer" in last and last["optimizer"] is not None:
+                    opt_p.load_state_dict(last["optimizer"])
+                    move_optimizer_state_to_device(opt_p, device)
+
+                if "scaler" in last and last["scaler"] is not None and scaler_p is not None:
+                    scaler_p.load_state_dict(last["scaler"])
+
+                pg_start_ep = int(last.get("epoch", 0)) + 1
+                best_pg = float(last.get("best_val_macro_f1", -1.0))
+                bad_pg = int(last.get("bad_epochs", 0))
+
+                if "epochs" in pg_history:
+                    pg_history["epochs"] = [
+                        e for e in pg_history["epochs"]
+                        if int(e.get("epoch", 0)) < pg_start_ep
+                    ]
+
+                print(
+                    f"🔁 Resuming PG-MIL training for seed {seed} "
+                    f"from epoch {pg_start_ep}/{CFG['CASE_EPOCHS']} | best_val={best_pg:.4f}"
+                )
+
+            except Exception as e:
+                print(f"⚠️ Could not resume PG-MIL checkpoint; restarting PG-MIL training. Reason: {e}")
+                best_pg, bad_pg, pg_start_ep = -1.0, 0, 1
+
+        if not (os.path.exists(pg_stage_done) and os.path.exists(pg_best)):
+            for ep in range(pg_start_ep, CFG["CASE_EPOCHS"] + 1):
+                ds_tr_bag.set_epoch(ep)
+
+                tr_bag = run_pg_mil_epoch(
+                    pgmil,
+                    dl_tr_bag,
+                    opt_p,
+                    scaler_p,
+                    pg_loss_fn,
+                    device,
+                    ep,
+                    train=True
+                )
+
+                va_bag = run_pg_mil_epoch(
+                    pgmil,
+                    dl_va_bag,
+                    None,
+                    None,
+                    pg_loss_fn,
+                    device,
+                    ep,
+                    train=False
+                )
+
+                va_pg_metrics = metrics_from_probs(
+                    va_bag["y"],
+                    va_bag["p"],
+                    CFG["CLASSES"]
+                )
+
+                val_f1 = va_pg_metrics["macro_f1"]
+
+                pg_history["epochs"].append({
+                    "epoch": ep,
+                    "train_loss": float(tr_bag["loss"]),
+                    "val_macro_f1": float(val_f1),
+                    "val_balanced_accuracy": float(va_pg_metrics["balanced_accuracy"]),
+                    "curriculum_gamma": float(tr_bag["gamma"]),
+                })
+
+                jdump(pg_history, pg_hist_path)
+
+                print(
+                    f"[seed{seed}] PG-MIL ep{ep:02d} "
+                    f"loss={tr_bag['loss']:.4f} val_macroF1={val_f1:.4f}"
+                )
+
+                is_best_pg = val_f1 > best_pg
+
+                if is_best_pg:
+                    best_pg = val_f1
+                    bad_pg = 0
+                else:
+                    bad_pg += 1
+
+                if CFG.get("SAVE_LAST_EVERY_EPOCH", True):
+                    torch.save({
+                        "epoch": ep,
+                        "model": pgmil.state_dict(),
+                        "optimizer": opt_p.state_dict(),
+                        "scaler": scaler_p.state_dict() if scaler_p is not None else None,
+                        "best_val_macro_f1": best_pg,
+                        "bad_epochs": bad_pg,
+                        "in_dim": in_dim,
+                    }, pg_last)
+
+                if is_best_pg:
+                    shutil.copy2(pg_last, pg_best)
+
+                if bad_pg >= CFG["MIL_EARLY_STOP_PATIENCE"]:
+                    print(f"⏹ Early stopping PG-MIL at epoch {ep}")
+                    break
+
+            if not os.path.exists(pg_best) and os.path.exists(pg_last):
+                shutil.copy2(pg_last, pg_best)
+
+            jdump({
+                "seed": seed,
+                "stage": "pgmil_case_training",
+                "status": "complete",
+                "best_val_macro_f1": best_pg,
+                "last_epoch": int(pg_history["epochs"][-1]["epoch"]) if pg_history.get("epochs") else None,
+                "in_dim": in_dim,
+            }, pg_stage_done)
+
+            print("✅ PG-MIL stage checkpoint complete:", pg_stage_done)
+
+        plot_training_curves(pg_history, plots_dir, f"seed{seed}_pgmil_case")
+
+        pg_state = safe_torch_load(pg_best, map_location="cpu")
+        pgmil.load_state_dict(pg_state["model"])
+        pgmil.to(device)
+
+        te_bag = run_pg_mil_epoch(
+            pgmil,
+            dl_te_bag,
+            None,
+            None,
+            pg_loss_fn,
+            device,
+            999,
+            train=False
+        )
+
+        pg_prefix = f"seed{seed}_proposed_pgmil_case_test"
+
+        pgmil_metrics, pgmil_ci = full_eval_and_plots(
+            te_bag["y"],
+            te_bag["p"],
+            ids=te_bag["case_ids"],
+            paths=None,
+            classes=CFG["CLASSES"],
+            prefix=pg_prefix,
+            run_dir=run_dir,
+        )
+
+        attn_csv = os.path.join(tables_dir, f"{pg_prefix}_attention_weights.csv")
+        proto_csv = os.path.join(tables_dir, f"{pg_prefix}_prototype_similarities.csv")
+
+        attn_df = pd.DataFrame(te_bag["attn_rows"])
+        proto_df = pd.DataFrame(te_bag["proto_rows"])
+
+        if not attn_df.empty:
+            attn_df = attn_df.sort_values(
+                ["CASE_ID", "Attention_Weight"],
+                ascending=[True, False]
+            )
+
+            attn_df.to_csv(attn_csv, index=False)
+
+            attn_df.groupby("CASE_ID").head(5).reset_index(drop=True).to_csv(
+                os.path.join(tables_dir, f"{pg_prefix}_top5_attended_slices.csv"),
+                index=False
+            )
+
+            plot_top_attention(attn_csv, plots_dir, top_cases=6)
+
+        if not proto_df.empty:
+            proto_df.to_csv(proto_csv, index=False)
+
+            proto_df.sort_values(
+                ["CASE_ID", "Similarity"],
+                ascending=[True, False]
+            ).groupby("CASE_ID").head(6).reset_index(drop=True).to_csv(
+                os.path.join(tables_dir, f"{pg_prefix}_top_prototype_matches.csv"),
+                index=False
+            )
+
+            plot_prototype_summary(proto_csv, plots_dir, pg_prefix)
+
+    summary = {
+        "seed": seed,
+        "backbone_used": backbone_used,
+
+        "slice_2p5d_test_macro_f1": slice_metrics["macro_f1"],
+        "slice_2p5d_test_balanced_accuracy": slice_metrics["balanced_accuracy"],
+        "slice_2p5d_test_auc_ovr_macro": slice_metrics["auc_ovr_macro"],
+
+        "case_meanprob_test_macro_f1": case_mean_metrics["macro_f1"],
+        "case_meanprob_test_balanced_accuracy": case_mean_metrics["balanced_accuracy"],
+        "case_meanprob_test_auc_ovr_macro": case_mean_metrics["auc_ovr_macro"],
+
+        "proposed_pgmil_case_test_macro_f1": pgmil_metrics["macro_f1"] if pgmil_metrics else None,
+        "proposed_pgmil_case_test_balanced_accuracy": pgmil_metrics["balanced_accuracy"] if pgmil_metrics else None,
+        "proposed_pgmil_case_test_auc_ovr_macro": pgmil_metrics["auc_ovr_macro"] if pgmil_metrics else None,
+        "proposed_pgmil_case_test_mcc": pgmil_metrics["mcc"] if pgmil_metrics else None,
+        "proposed_pgmil_case_test_kappa": pgmil_metrics["cohen_kappa"] if pgmil_metrics else None,
+
+        "case_meanprob_ci95": case_mean_ci,
+        "proposed_pgmil_ci95": pgmil_ci,
+    }
+
+    jdump(summary, done_path)
+    print("✅ Seed complete:", done_path)
+
+    return summary
+
+# =============================================================================
+# B9) CROSS-SEED SUMMARY AND PACKAGING
+# =============================================================================
+
+def summarize_across_seeds(summary_df, out_dir):
+    key_cols = [
+        "slice_2p5d_test_macro_f1",
+        "case_meanprob_test_macro_f1",
+        "proposed_pgmil_case_test_macro_f1",
+        "proposed_pgmil_case_test_balanced_accuracy",
+        "proposed_pgmil_case_test_auc_ovr_macro",
+        "proposed_pgmil_case_test_mcc",
+        "proposed_pgmil_case_test_kappa",
+    ]
+    rows = []
+    for col in key_cols:
+        if col not in summary_df.columns:
+            continue
+        vals = pd.to_numeric(summary_df[col], errors="coerce").dropna().values
+        if len(vals) == 0:
+            continue
+        rows.append({
+            "Metric": col,
+            "Mean": float(np.mean(vals)),
+            "Std": float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0,
+            "Min": float(np.min(vals)),
+            "Max": float(np.max(vals)),
+            "N_Seeds": int(len(vals)),
+        })
+    out = pd.DataFrame(rows)
+    out_csv = os.path.join(out_dir, "cross_seed_mean_std_metrics.csv")
+    out.to_csv(out_csv, index=False)
+    print("📌 Cross-seed mean±SD saved:", out_csv)
+
+    available = [c for c in key_cols if c in summary_df.columns]
+    plot_data, labels = [], []
+    for c in available:
+        vals = pd.to_numeric(summary_df[c], errors="coerce").dropna().values
+        if len(vals) > 0:
+            plot_data.append(vals)
+            labels.append(c.replace("proposed_pgmil_case_test_", "PGMIL_").replace("case_meanprob_test_", "MeanProb_").replace("slice_2p5d_test_", "Slice_"))
+    if plot_data:
+        plt.figure(figsize=(max(8, len(labels) * 1.4), 5))
+        plt.boxplot(plot_data, labels=labels, showmeans=True)
+        plt.xticks(rotation=45, ha="right")
+        plt.ylabel("Score")
+        plt.title("Cross-seed performance distribution")
+        plt.tight_layout()
+        savefig(os.path.join(out_dir, "cross_seed_metric_boxplot_1000dpi.png"))
+        plt.show()
+    return out
+
+
+def write_methods_and_results_snippets(run_root, best_seed, cross_seed_df):
+    paper_dir = os.path.join(run_root, "paper_package")
+    ensure_dir(paper_dir)
+
+    methods = f"""
+A classification-only prototype-guided 2.5D attention multi-instance transformer was developed for CHCC, HCC, and ICC classification from uncropped abdominal CT images. For each center slice, the previous, current, and next slices were stacked as a 2.5D input and processed using a Swin Transformer backbone. When internet access is unavailable, the backbone is initialized without external pretrained weights to keep the experiment fully runnable in an offline Kaggle environment. A difficulty-aware curriculum focal loss was used during training, gradually increasing emphasis on harder examples. Case-level diagnosis was obtained using an attention-based multi-instance learning module that aggregated slice-level features within each patient/case. To improve interpretability, class-associated learnable prototypes were integrated at the case-representation level, allowing the model to report prototype similarities and top-attended slices for each test case. No liver or tumour segmentation and no external detection/cropping model was used.
+
+Evaluation was performed at slice level, case-level mean-probability aggregation level, and proposed prototype-guided MIL case level. Metrics included accuracy, balanced accuracy, macro/weighted/micro F1, macro precision, macro recall, class-wise sensitivity, specificity, precision/PPV, NPV, AUROC, AUPRC/AP, MCC, Cohen's kappa, log loss, Brier score, ECE, MCE, and bootstrap 95% confidence intervals. Plots were saved at {CFG['DPI_SAVE']} DPI. Experiments were repeated across seeds {CFG['SEEDS']}.
+""".strip()
+    with open(os.path.join(paper_dir, "methods_sectionB_snippet.txt"), "w") as f:
+        f.write(methods)
+
+    lines = []
+    if not cross_seed_df.empty:
+        for _, r in cross_seed_df.iterrows():
+            lines.append(f"{r['Metric']}: {r['Mean']:.4f} ± {r['Std']:.4f} across {int(r['N_Seeds'])} seeds; range {r['Min']:.4f}–{r['Max']:.4f}.")
+    with open(os.path.join(paper_dir, "results_sectionB_cross_seed_snippet.txt"), "w") as f:
+        f.write("\n".join(lines))
+    jdump({"best_seed": int(best_seed), "seeds": CFG["SEEDS"]}, os.path.join(paper_dir, "best_seed.json"))
+
+
+def make_paper_package(run_root, best_seed):
+    paper_dir = os.path.join(run_root, "paper_package")
+    fig_dir = os.path.join(paper_dir, "figures_1000dpi")
+    tab_dir = os.path.join(paper_dir, "tables")
+    metrics_dir = os.path.join(paper_dir, "metrics_json")
+    ensure_dir(fig_dir)
+    ensure_dir(tab_dir)
+    ensure_dir(metrics_dir)
+
+    for fn in ["summary_all_seeds.csv", "cross_seed_mean_std_metrics.csv"]:
+        src = os.path.join(run_root, fn)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(tab_dir, fn))
+
+    best_run = os.path.join(run_root, "runs", f"seed{best_seed}")
+    for root, _, files in os.walk(best_run):
+        for fn in files:
+            src = os.path.join(root, fn)
+            if fn.lower().endswith(".png"):
+                shutil.copy2(src, os.path.join(fig_dir, f"seed{best_seed}_" + fn))
+            elif fn.lower().endswith((".csv", ".txt")):
+                shutil.copy2(src, os.path.join(tab_dir, f"seed{best_seed}_" + fn))
+            elif fn.lower().endswith(".json"):
+                shutil.copy2(src, os.path.join(metrics_dir, f"seed{best_seed}_" + fn))
+
+    fig_rows = []
+    for fn in sorted(os.listdir(fig_dir)):
+        fig_rows.append({"Figure_File": fn, "DPI": CFG["DPI_SAVE"], "Suggested_Use": "paper/supplementary"})
+    pd.DataFrame(fig_rows).to_csv(os.path.join(paper_dir, "figure_index.csv"), index=False)
+
+    paper_zip = os.path.join(run_root, "PAPER_PACKAGE_1000DPI.zip")
+    with zipfile.ZipFile(paper_zip, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(paper_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                z.write(fp, arcname=os.path.relpath(fp, paper_dir))
+    print("📦 Paper package ZIP:", paper_zip)
+    return paper_zip
+
+
+def make_full_results_zip(run_root):
+    zip_path = os.path.join(run_root, "FULL_SECTION_B_RESULTS.zip")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk(run_root):
+            for fn in files:
+                if fn.endswith(".zip"):
+                    continue
+                if not CFG["ZIP_INCLUDE_CHECKPOINTS"] and fn.endswith(".pt"):
+                    continue
+                fp = os.path.join(root, fn)
+                z.write(fp, arcname=os.path.relpath(fp, run_root))
+    print("📦 Full results ZIP:", zip_path)
+    return zip_path
+
+
+# =============================================================================
+# B10) MAIN EXECUTION
+# =============================================================================
+
+ensure_dir(CFG["RUN_ROOT"])
+jdump(CFG, os.path.join(CFG["RUN_ROOT"], "sectionB_config.json"))
+
+all_summaries = []
+for seed in CFG["SEEDS"]:
+    try:
+        all_summaries.append(run_one_seed(seed))
+    except torch.cuda.OutOfMemoryError:
+        print(f"❌ CUDA OOM at seed={seed}. Reduce SLICE_BATCH, IMG_SIZE, or MAX_SLICES_TRAIN.")
+        torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"❌ Runtime error at seed={seed}: {type(e).__name__}: {e}")
+
+summary_df = pd.DataFrame(all_summaries)
+summary_csv = os.path.join(CFG["RUN_ROOT"], "summary_all_seeds.csv")
+summary_df.to_csv(summary_csv, index=False)
+
+print("\n==================== ALL-SEED SUMMARY ====================")
+print(summary_df if not summary_df.empty else "No successful seed runs.")
+print("📌 Saved:", summary_csv)
+
+best_seed = None
+if not summary_df.empty:
+    if "proposed_pgmil_case_test_macro_f1" in summary_df.columns and summary_df["proposed_pgmil_case_test_macro_f1"].notna().any():
+        best_seed = int(summary_df.sort_values("proposed_pgmil_case_test_macro_f1", ascending=False).iloc[0]["seed"])
+    else:
+        best_seed = int(summary_df.sort_values("case_meanprob_test_macro_f1", ascending=False).iloc[0]["seed"])
+print("✅ Best seed:", best_seed)
+
+cross_seed_df = summarize_across_seeds(summary_df, CFG["RUN_ROOT"]) if not summary_df.empty else pd.DataFrame()
+
+if CFG["MAKE_PAPER_PACKAGE"] and best_seed is not None:
+    write_methods_and_results_snippets(CFG["RUN_ROOT"], best_seed, cross_seed_df)
+    make_paper_package(CFG["RUN_ROOT"], best_seed)
+
+make_full_results_zip(CFG["RUN_ROOT"])
+
+print("\n✅ SECTION B COMPLETE.")
+print("Output root:", CFG["RUN_ROOT"])
+print("Plots DPI:", CFG["DPI_SAVE"])
+print("Paper package:", os.path.join(CFG["RUN_ROOT"], "PAPER_PACKAGE_1000DPI.zip"))
+print("Full results:", os.path.join(CFG["RUN_ROOT"], "FULL_SECTION_B_RESULTS.zip"))
